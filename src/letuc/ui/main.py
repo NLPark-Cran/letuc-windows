@@ -1,8 +1,9 @@
 """Main application wiring: starts the proxy listeners, the mieru client,
 and the GUI in one event loop.
 
-PyQt6's event loop and asyncio don't share a loop, so we park the asyncio
-side on pyqt6-asyncio and call into it from Qt slots.
+PyQt6's event loop and asyncio don't share a loop by default, so we drive
+both from a qasync QEventLoop: the Qt UI and the asyncio sockets tick on
+the same thread, and Qt slots hand work to asyncio via create_task.
 """
 
 from __future__ import annotations
@@ -13,7 +14,8 @@ import os
 import sys
 import traceback
 
-from PyQt6.QtCore import Qt, QTimer
+import qasync
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QSpinBox,
     QCheckBox, QPlainTextEdit, QPushButton, QTabWidget, QVBoxLayout,
@@ -223,7 +225,10 @@ class LetucApp:
         self.tun = None
         self.window = MainWindow(self)
         self.tray = TrayIcon(self)
-        self.loop = asyncio.new_event_loop()
+        # One loop for both Qt and asyncio. run_until_complete on a plain
+        # loop would stop serving sockets the moment the call returned —
+        # that is exactly the "listening but nobody accepts" freeze.
+        self.loop = qasync.QEventLoop(self.qapp)
         asyncio.set_event_loop(self.loop)
 
         handler = _QtLogHandler(self.window)
@@ -252,7 +257,11 @@ class LetucApp:
             self.window.show()
         if self.config.get("anti_detection", "clock_check_on_startup"):
             self._check_clock()
-        return self.qapp.exec()
+        # qasync stops the asyncio side when the QApplication quits, so a
+        # tray quit unwinds both halves in order.
+        with self.loop:
+            self.loop.run_forever()
+        return 0
 
     def _check_clock(self):
         import time
@@ -322,7 +331,9 @@ class LetucApp:
         # anyone having to configure them. Best-effort: failures are logged
         # and the client keeps working. The active server must be in the
         # bypass list — sending the server's own traffic back through the
-        # proxy would loop it straight into the tunnel.
+        # proxy would loop it straight into the tunnel. The subprocess
+        # calls run on a worker thread: blocking the shared loop here
+        # freezes both the GUI and every proxied connection.
         try:
             exceptions = self.config.get(
                 "anti_detection", "system_proxy_exceptions",
@@ -330,8 +341,10 @@ class LetucApp:
             host = self._active_preset()[0]
             if host and host not in exceptions:
                 exceptions = exceptions + ";" + host
-            sysproxy.set_internet_options_proxy(listen, mixed, exceptions)
-            sysproxy.set_winhttp_proxy(listen, mixed)
+            await asyncio.to_thread(
+                sysproxy.set_internet_options_proxy, listen, mixed, exceptions)
+            await asyncio.to_thread(
+                sysproxy.set_winhttp_proxy, listen, mixed)
         except Exception as e:
             logger.warning("system proxy setup failed: %s", e)
 
@@ -380,8 +393,8 @@ class LetucApp:
             except Exception as e:
                 logger.warning("error while stopping services: %s", e)
         try:
-            sysproxy.clear_internet_options_proxy()
-            sysproxy.clear_winhttp_proxy()
+            await asyncio.to_thread(sysproxy.clear_internet_options_proxy)
+            await asyncio.to_thread(sysproxy.clear_winhttp_proxy)
         except Exception as e:
             logger.warning("failed to clear system proxy on exit: %s", e)
         self.qapp.quit()
@@ -768,12 +781,35 @@ class MainWindow(QMainWindow):
         self._persist_config()
         self.start_btn.setDisabled(True)
         self.stop_btn.setDisabled(False)
-        self.app.loop.run_until_complete(self.app.start_services())
+        task = self.app.loop.create_task(self.app.start_services())
+        task.add_done_callback(self._start_finished)
+
+    def _start_finished(self, task):
+        """Surface a startup failure instead of leaving a dead client."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.error("start failed: %s", exc)
+        self.log.appendPlainText("启动失败：%s" % exc)
+        self.set_status("start failed")
+        self.start_btn.setDisabled(False)
+        self.stop_btn.setDisabled(True)
 
     def _on_stop(self):
         self.stop_btn.setDisabled(True)
         self.start_btn.setDisabled(False)
-        self.app.loop.run_until_complete(self.app.stop_services())
+        task = self.app.loop.create_task(self.app.stop_services())
+        task.add_done_callback(self._stop_finished)
+
+    def _stop_finished(self, task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("stop failed: %s", exc)
+            self.log.appendPlainText("停止时出错：%s" % exc)
 
     def _persist_config(self):
         cfg = self.app.config
@@ -1050,7 +1086,11 @@ class TrayIcon:
         self.show_action.triggered.connect(self.app.window.show)
         self.start_action.triggered.connect(self._start)
         self.stop_action.triggered.connect(self._stop)
-        self.quit_action.triggered.connect(self.app._quit)
+        # _quit is a coroutine; connecting it directly would create the
+        # coroutine and never run it, which is how "停止代理并完全退出"
+        # used to silently do nothing.
+        self.quit_action.triggered.connect(
+            lambda: self.app.loop.create_task(self.app._quit()))
         if self.tray.isSystemTrayAvailable():
             self.tray.show()
 

@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "letuc"
 
+# See system/proxy.py for why the flags matter: the frozen exe has no
+# console, and a console tool spawned without CREATE_NO_WINDOW dies with
+# 0xC0000142 before it can do anything.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _run(cmd, check):
+    return subprocess.run(cmd, check=check, capture_output=True,
+                          stdin=subprocess.DEVNULL, text=True,
+                          creationflags=_NO_WINDOW)
+
 
 def _exe_path():
     """The path that should be written into the Run key.
@@ -37,12 +48,11 @@ def _exe_path():
 def is_enabled():
     """Return True if letuc is set to start with the current user."""
     try:
-        out = subprocess.run(
-            ["reg", "query",
-             r"HKCU\\" + RUN_KEY,
-             "/v", VALUE_NAME],
-            capture_output=True, text=True,
-        ).stdout
+        # Single backslash: reg.exe rejects "HKCU\\Software" as an
+        # invalid key name.
+        out = _run(["reg", "query",
+                    "HKCU\\" + RUN_KEY,
+                    "/v", VALUE_NAME], check=False).stdout
         return VALUE_NAME in out
     except Exception as e:
         logger.warning("startup query failed: %s", e)
@@ -55,22 +65,18 @@ def enable():
     if exe is None:
         raise RuntimeError("not running from a frozen executable")
     cmd = '"%s" --minimized' % exe
-    subprocess.run(
-        ["reg", "add",
-         r"HKCU\\" + RUN_KEY,
-         "/v", VALUE_NAME, "/t", "REG_SZ", "/d", cmd, "/f"],
-        check=True, capture_output=True)
+    _run(["reg", "add",
+          "HKCU\\" + RUN_KEY,
+          "/v", VALUE_NAME, "/t", "REG_SZ", "/d", cmd, "/f"], check=True)
     logger.info("startup enabled: %s", cmd)
 
 
 def disable():
     """Remove the letuc Run entry."""
     try:
-        subprocess.run(
-            ["reg", "delete",
-             r"HKCU\\" + RUN_KEY,
-             "/v", VALUE_NAME, "/f"],
-            check=True, capture_output=True)
+        _run(["reg", "delete",
+              "HKCU\\" + RUN_KEY,
+              "/v", VALUE_NAME, "/f"], check=True)
     except subprocess.CalledProcessError as e:
         # "value not found" is exit code 1 and is not an error here.
         if e.returncode != 1:

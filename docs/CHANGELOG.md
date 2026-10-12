@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.2.1 — 2026-10-13
+
+### Fixed
+
+- `src/letuc/ui/main.py` — the asyncio loop was created but never pumped:
+  `_on_start` ran `start_services` via `run_until_complete` and the loop
+  stopped for good when it returned. Listeners showed LISTENING but nobody
+  ever called accept, so every browser connection piled up in CLOSE_WAIT
+  and new ones were refused. Qt and asyncio now share a qasync
+  `QEventLoop`; slots schedule coroutines with `create_task` and surface
+  failures in the log.
+- `src/letuc/ui/main.py` — the tray's 停止代理并完全退出 entry was connected
+  to a coroutine function directly, so it created the coroutine and never
+  ran it: quitting left the system proxy pointing at a dead client and
+  broke all browsing until the settings were reset by hand. It is now
+  scheduled on the loop, stops services, and clears the system proxy.
+- `src/letuc/system/proxy.py`, `src/letuc/system/startup.py`,
+  `src/letuc/system/wintun_install.py` — console tools (reg.exe, netsh.exe)
+  spawned from the windowed exe died at startup with 0xC0000142 and, on
+  the way down, showed a modal Application Error that blocked the event
+  loop until it was clicked. All subprocess calls now use
+  CREATE_NO_WINDOW + stdin DEVNULL, and the start/exit paths run them on
+  worker threads.
+- `src/letuc/system/startup.py` — the Run key path was built as
+  `HKCU\\Software...` (double backslash in a raw string), which reg.exe
+  rejects as an invalid key name, so the autostart checkbox could never
+  work. Single backslash now.
+- `src/letuc/proxy/listeners.py` — the mixed port wrapped the peeked first
+  byte as `bytes([first])`, but readexactly already returns bytes, so every
+  mixed-port connection died with TypeError before dispatch. SOCKS5 on the
+  mixed port was equally dead.
+- `src/letuc/proxy/http.py` — plain-GET forwarding partitioned the target
+  on ":" before splitting off the path, so "host/" was resolved as a
+  hostname and every plain HTTP request failed; the forwarded request line
+  also kept the absolute URI instead of origin-form.
+
+### Changed
+
+- `requirements.txt` — `pyqt6-asyncio` removed (it does not exist on PyPI;
+  the dependency was aspirational and never installed). Replaced with
+  `qasync>=0.27.0`, which provides the QEventLoop the code was designed
+  around.
+
 ## v0.2.0 — 2026-10-12
 
 ### Added

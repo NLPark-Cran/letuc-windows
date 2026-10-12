@@ -138,11 +138,16 @@ def install(parent=None):
         return False
 
     # Run as an elevated process. /high 优先级 + the exe's own manifest
-    # trigger the standard UAC consent prompt.
+    # trigger the standard UAC consent prompt. CREATE_NO_WINDOW applies to
+    # every console tool we spawn from the windowed exe (see
+    # system/proxy.py); the installer is a GUI app, so this only suppresses
+    # a pointless console flash.
     try:
         rc = subprocess.run(
             [installer, "/quiet", "/install"],
-            check=False, capture_output=True, timeout=300)
+            check=False, capture_output=True, timeout=300,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         logger.info("wintun installer rc=%d", rc.returncode)
     except Exception as e:
         logger.warning("wintun installer failed: %s", e)

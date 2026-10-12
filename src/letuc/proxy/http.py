@@ -70,11 +70,17 @@ class HttpProxyServer:
             return
 
         if url.startswith("http://"):
-            target = url[len("http://"):]
+            rest = url[len("http://"):]
         else:
-            target = url
+            rest = url
 
-        host, _, port = target.partition(":")
+        # Split authority from path BEFORE looking for the port. Parsing
+        # "www.baidu.com/" by partitioning on ":" leaves the path glued to
+        # the host, which then fails to resolve and the connection dies
+        # with an empty reply.
+        authority, _, path = rest.partition("/")
+        path = "/" + path if path else "/"
+        host, _, port = authority.partition(":")
         port = int(port) if port else 80
 
         outbound = self.engine.match(host, None)
@@ -92,7 +98,9 @@ class HttpProxyServer:
             remote_writer.write(body)
             await remote_writer.drain()
 
-        request = f"{method} {url} {version}\r\n".encode()
+        # Origin servers expect origin-form request targets, not the
+        # absolute URI the client sent to us.
+        request = f"{method} {path} {version}\r\n".encode()
         for k, v in headers.items():
             request += f"{k}: {v}\r\n".encode()
         request += b"\r\n"

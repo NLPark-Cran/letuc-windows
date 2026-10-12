@@ -68,7 +68,7 @@ class _PrependedReader:
 
     def __init__(self, reader, first):
         self._reader = reader
-        self._buf = bytes([first])
+        self._buf = first  # already bytes from readexactly(1)
 
     async def readexactly(self, n):
         while len(self._buf) < n:

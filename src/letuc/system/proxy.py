@@ -17,14 +17,26 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 
+# The frozen exe is a windowed process with no console. Console tools
+# (reg.exe, netsh.exe) spawned from it inherit no usable console handles
+# and die at startup with 0xC0000142 (STATUS_DLL_INIT_FAILED) — or worse,
+# pop a modal "Application Error" that waits for a click while the event
+# loop is blocked. CREATE_NO_WINDOW keeps them invisible and headless;
+# DEVNULL gives stdin a valid handle.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _run(cmd):
+    return subprocess.run(cmd, check=True, capture_output=True,
+                          stdin=subprocess.DEVNULL,
+                          creationflags=_NO_WINDOW)
+
 
 def set_winhttp_proxy(host, port):
     """Configure the WinHTTP proxy used by terminal processes."""
     try:
-        subprocess.run(
-            ["netsh", "winhttp", "set", "proxy",
-             f"{host}:{port}", ""],
-            check=True, capture_output=True)
+        _run(["netsh", "winhttp", "set", "proxy",
+              f"{host}:{port}", ""])
         logger.info("winhttp proxy set to %s:%d", host, port)
     except Exception as e:
         logger.warning("failed to set winhttp proxy: %s", e)
@@ -32,9 +44,7 @@ def set_winhttp_proxy(host, port):
 
 def clear_winhttp_proxy():
     try:
-        subprocess.run(
-            ["netsh", "winhttp", "set", "proxy", "", ""],
-            check=True, capture_output=True)
+        _run(["netsh", "winhttp", "set", "proxy", "", ""])
         logger.info("winhttp proxy cleared")
     except Exception as e:
         logger.warning("failed to clear winhttp proxy: %s", e)
@@ -53,22 +63,16 @@ def set_internet_options_proxy(host, port, exceptions=None):
         "localhost;127.*;10.*;172.*;192.168.*")
     proxy_value = '"http=%s:%d"' % (host, port)
     try:
-        subprocess.run(
-            ["reg", "add",
-             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-             "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"],
-            check=True, capture_output=True)
-        subprocess.run(
-            ["reg", "add",
-             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-             "/v", "ProxyServer", "/t", "REG_SZ", "/d", proxy_value, "/f"],
-            check=True, capture_output=True)
-        subprocess.run(
-            ["reg", "add",
-             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-             "/v", "ProxyOverride", "/t", "REG_SZ",
-             "/d", exceptions, "/f"],
-            check=True, capture_output=True)
+        _run(["reg", "add",
+              r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+              "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"])
+        _run(["reg", "add",
+              r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+              "/v", "ProxyServer", "/t", "REG_SZ", "/d", proxy_value, "/f"])
+        _run(["reg", "add",
+              r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+              "/v", "ProxyOverride", "/t", "REG_SZ",
+              "/d", exceptions, "/f"])
         logger.info("internet options proxy set to %s:%d", host, port)
     except Exception as e:
         logger.warning("failed to set internet options proxy: %s", e)
@@ -76,11 +80,9 @@ def set_internet_options_proxy(host, port, exceptions=None):
 
 def clear_internet_options_proxy():
     try:
-        subprocess.run(
-            ["reg", "add",
-             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-             "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"],
-            check=True, capture_output=True)
+        _run(["reg", "add",
+              r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+              "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"])
         logger.info("internet options proxy cleared")
     except Exception as e:
         logger.warning("failed to clear internet options proxy: %s", e)

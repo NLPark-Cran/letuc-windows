@@ -54,7 +54,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # qasync imports every Qt binding it supports so it can pick one at
+    # runtime; freezing must not follow those edges or PyInstaller aborts
+    # on "multiple Qt bindings".
+    excludes=["PySide6", "PySide2", "PyQt5"],
     noarchive=False,
     optimize=0,
 )
