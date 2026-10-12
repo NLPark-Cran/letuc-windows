@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+build/
+dist/
+dist_new/
+*.egg-info/
+.eggs/
+*.log
+config.json
+rule_data/
+
+# Local-only: agent collaboration notes and dev probes, not for the repo.
+AGENTS.md
+*.etag  

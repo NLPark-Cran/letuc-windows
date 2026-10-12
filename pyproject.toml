@@ -1,0 +1,29 @@
+[build-system]
+requires = ["pyinstaller>=6.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "letuc"
+version = "0.1.0"
+description = "A small, readable mieru client for Windows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "NLPark-Cran" }]
+dependencies = [
+    "cryptography>=42.0.0",
+    "PyQt6>=6.7.0",
+    "pyqt6-asyncio>=0.1.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0.0"]
+
+[tool.setuptools]
+packages = ["letuc"]
+
+[tool.setuptools.package-data]
+letuc = ["ui/resources/*", "*.dll"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
