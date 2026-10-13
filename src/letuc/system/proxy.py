@@ -33,35 +33,40 @@ def _run(cmd):
 
 
 def set_winhttp_proxy(host, port):
-    """Configure the WinHTTP proxy used by terminal processes."""
+    """Sync the WinHTTP proxy from Internet Options settings.
+
+    Terminal processes (cmd, git, curl) read WinHTTP, not Internet
+    Options. The supported way to mirror the IE settings is
+    `netsh winhttp import proxy source=ie`; setting it by hand needs
+    a `proxy-server=` keyword the previous invocation was missing.
+    Must run after set_internet_options_proxy().
+    """
     try:
-        _run(["netsh", "winhttp", "set", "proxy",
-              f"{host}:{port}", ""])
-        logger.info("winhttp proxy set to %s:%d", host, port)
+        _run(["netsh", "winhttp", "import", "proxy", "source=ie"])
+        logger.info("winhttp proxy imported from ie settings")
     except Exception as e:
-        logger.warning("failed to set winhttp proxy: %s", e)
+        logger.warning("failed to import winhttp proxy: %s", e)
 
 
 def clear_winhttp_proxy():
     try:
-        _run(["netsh", "winhttp", "set", "proxy", "", ""])
-        logger.info("winhttp proxy cleared")
+        _run(["netsh", "winhttp", "reset", "proxy"])
+        logger.info("winhttp proxy reset")
     except Exception as e:
-        logger.warning("failed to clear winhttp proxy: %s", e)
+        logger.warning("failed to reset winhttp proxy: %s", e)
 
 
 def set_internet_options_proxy(host, port, exceptions=None):
     """Set the system-wide proxy that browsers and apps read.
 
-    The ProxyServer value is `http=host:port`. The `=` is part of the
-    value, but reg.exe treats `/d` as the start of a new switch whenever
-    it sees one, so an unquoted value silently gets truncated — browsers
-    then read a proxy with no port and fail to connect. Quote the value
-    and escape any embedded quotes so the whole string survives.
+    V2RayN style: a plain `host:port` ProxyServer value (no `http=`
+    prefix), so every scheme routes through the mixed port, followed by
+    a WinINet refresh broadcast so Explorer, browsers and the Settings
+    app pick the change up without waiting for their own polling cycle.
     """
     exceptions = exceptions or (
         "localhost;127.*;10.*;172.*;192.168.*")
-    proxy_value = '"http=%s:%d"' % (host, port)
+    proxy_value = "%s:%d" % (host, port)
     try:
         _run(["reg", "add",
               r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
@@ -73,6 +78,7 @@ def set_internet_options_proxy(host, port, exceptions=None):
               r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
               "/v", "ProxyOverride", "/t", "REG_SZ",
               "/d", exceptions, "/f"])
+        _notify_wininet_changed()
         logger.info("internet options proxy set to %s:%d", host, port)
     except Exception as e:
         logger.warning("failed to set internet options proxy: %s", e)
@@ -83,9 +89,23 @@ def clear_internet_options_proxy():
         _run(["reg", "add",
               r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
               "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"])
+        _notify_wininet_changed()
         logger.info("internet options proxy cleared")
     except Exception as e:
         logger.warning("failed to clear internet options proxy: %s", e)
+
+
+def _notify_wininet_changed():
+    """Broadcast INTERNET_OPTION_SETTINGS_CHANGED / REFRESH.
+
+    Registry writes alone leave the Settings UI and some apps showing
+    stale state; WinINet listens for this broadcast.
+    """
+    import ctypes
+
+    internet_set_option = ctypes.windll.wininet.InternetSetOptionW
+    internet_set_option(None, 39, None, 0)  # SETTINGS_CHANGED
+    internet_set_option(None, 37, None, 0)  # REFRESH
 
 
 __all__ = [

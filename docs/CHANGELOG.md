@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.2.3 — 2026-10-13
+
+### Fixed
+
+- `src/letuc/system/proxy.py` — WinHTTP sync rewrote: the old
+  `netsh winhttp set proxy 127.0.0.1:20808 ""` invocation passed a
+  dangling empty argument and always exited 1, so terminal processes
+  never got the proxy. Now runs `netsh winhttp import proxy source=ie`
+  after the Internet Options write (and `reset proxy` on teardown),
+  mirroring the IE settings including the bypass list.
+- `src/letuc/system/proxy.py` — Internet Options now writes a plain
+  `host:port` ProxyServer value (V2RayN style) instead of
+  `http=host:port`, and broadcasts INTERNET_OPTION_SETTINGS_CHANGED /
+  REFRESH via WinINet so Explorer, browsers and the Settings app see
+  the change immediately instead of showing a stale toggle.
+
 ## v0.2.2 — 2026-10-13
 
 ### Fixed
