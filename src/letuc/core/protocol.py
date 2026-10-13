@@ -102,10 +102,19 @@ def _aead_decrypt(key, nonce, ciphertext, aad=b""):
 # key derivation
 # ---------------------------------------------------------------------------
 
+def round_time(unix_time):
+    """Round to the 2-minute grid the way Go's time.Round does: half away
+    from zero. Python's round() is banker's rounding and disagrees when
+    unix_time % 120 == 60, which would pick the wrong key once every 120
+    seconds on average."""
+    return ((unix_time + TIME_SALT_INTERVAL // 2)
+            // TIME_SALT_INTERVAL) * TIME_SALT_INTERVAL
+
+
 def derive_key(username, password, unix_time):
     """PBKDF2-SHA256 key as specified by the mieru protocol."""
     hashed_password = hashlib.sha256(password.encode() + b"\x00" + username.encode()).digest()
-    rounded = round(unix_time / TIME_SALT_INTERVAL) * TIME_SALT_INTERVAL
+    rounded = round_time(unix_time)
     time_salt = hashlib.sha256(struct.pack(">Q", rounded)).digest()
     return hashlib.pbkdf2_hmac("sha256", hashed_password, time_salt, 64, dklen=32)
 
@@ -115,16 +124,30 @@ def time_salt_candidates(username, password):
     now = int(time.time())
     out = []
     for delta in (-TIME_SALT_INTERVAL, 0, TIME_SALT_INTERVAL):
-        rounded = round((now + delta) / TIME_SALT_INTERVAL) * TIME_SALT_INTERVAL
+        rounded = round_time(now + delta)
         out.append((rounded, derive_key(username, password, rounded)))
     return out
 
 
-def make_nonce(key, counter):
-    """24-byte nonce. The low 4 bytes carry a user lookup marker."""
-    nonce = os.urandom(24)
-    nonce = (counter.to_bytes(4, "big") + nonce[4:]).ljust(24, b"\x00")[:24]
-    return nonce
+def make_nonce():
+    """A fresh 24-byte nonce. Pure random, like upstream."""
+    return os.urandom(24)
+
+
+def increment_nonce(nonce):
+    """The nonce as a 24-byte big-endian integer, plus one.
+
+    TCP carries the nonce only in the first segment of each direction;
+    every AEAD operation after that (metadata and payload count
+    separately) advances this counter. Carry starts at the last byte and
+    walks backwards, including over the 4-byte user marker.
+    """
+    n = bytearray(nonce)
+    for i in range(len(n) - 1, -1, -1):
+        n[i] = (n[i] + 1) & 0xFF
+        if n[i] != 0:
+            break
+    return bytes(n)
 
 
 def stamp_nonce(username, nonce):
@@ -199,59 +222,93 @@ def decode_metadata(raw):
 
 
 # ---------------------------------------------------------------------------
-# segment encrypt/decrypt
+# segment encrypt/decrypt — TCP wire format
+#
+# Layout (verified against enfein/mieru pkg/protocol/underlay_stream.go):
+#
+#   first segment per direction:
+#       nonce(24) | encMetadata(32) | metaTag(16)
+#       | [encPayload | payloadTag(16)] | padding2(suffixLen)
+#   later session segments:
+#       encMetadata(32) | metaTag(16) | [encPayload | tag] | padding2
+#   data/ack segments:
+#       encMetadata(32) | metaTag(16) | padding1(prefixLen)
+#       | [encPayload | tag] | padding2(suffixLen)
+#
+# There is no padding before the nonce. The nonce appears on the wire once
+# per direction; every AEAD operation afterwards (metadata and payload are
+# separate operations) advances the implicit nonce by one.
 # ---------------------------------------------------------------------------
 
-class Session:
-    """State for one direction of a TCP session."""
+class SendCipher:
+    """Encrypts one direction of a TCP underlay connection.
 
-    def __init__(self, session_id, key, username=""):
-        self.session_id = session_id
+    Connection-level, shared by every session multiplexed on the TCP
+    stream: the nonce chain belongs to the direction, not the session.
+    """
+
+    def __init__(self, key, username=""):
         self.key = key
         self.username = username
-        self.send_seq = 0
-        self.recv_seq = 0
-        self.send_nonce_counter = 0
-        self.recv_nonce_counter = 0
+        self._nonce = None
 
-    def encrypt(self, protocol_type, payload=b"", suffix_length=0):
-        timestamp = int(time.time() // 60) & 0xFFFFFFFF
-        if protocol_type in (OPEN_SESSION_REQUEST, CLOSE_SESSION_REQUEST):
-            metadata = encode_session_metadata(
-                protocol_type, timestamp, self.session_id, self.send_seq,
-                0, len(payload), suffix_length)
+    def encrypt_segment(self, metadata, payload=b"", prefix=b"", suffix=b""):
+        if self._nonce is None:
+            self._nonce = stamp_nonce(self.username, make_nonce())
+            wire_nonce = self._nonce
         else:
-            metadata = encode_data_metadata(
-                protocol_type, timestamp, self.session_id, self.send_seq,
-                0, 0, 0, 0, len(payload), suffix_length)
-
-        nonce = stamp_nonce(self.username, make_nonce(self.key, self.send_nonce_counter))
-        self.send_nonce_counter += 1
-
-        encrypted_meta = _aead_encrypt(self.key, nonce, metadata)
-        encrypted_payload = _aead_encrypt(self.key, nonce, payload) if payload else b""
-        segment = (
-            os.urandom(8) + nonce + encrypted_meta
-            + os.urandom(4) + encrypted_payload + os.urandom(suffix_length)
-        )
-        self.send_seq += 1
-        return segment
+            self._nonce = increment_nonce(self._nonce)
+            wire_nonce = b""
+        out = wire_nonce + _aead_encrypt(self.key, self._nonce, metadata)
+        if prefix:
+            out += prefix
+        if payload:
+            self._nonce = increment_nonce(self._nonce)
+            out += _aead_encrypt(self.key, self._nonce, payload)
+        return out + suffix
 
 
-def decrypt(key, data, username=""):
-    """Decrypt one segment. Returns {metadata..., "payload": bytes}."""
-    if len(data) < 8 + 24 + 48 + 4:
-        raise ValueError("segment too short")
-    nonce = data[8:32]
-    info = decode_metadata(_aead_decrypt(key, nonce, data[32:80]))
-    payload_start = 80 + 4
-    payload_len = info.get("payload_length", 0)
-    if payload_len:
-        info["payload"] = _aead_decrypt(
-            key, nonce, data[payload_start:payload_start + payload_len + 16])
-    else:
-        info["payload"] = b""
-    return info
+class RecvCipher:
+    """Decrypts one direction of a TCP underlay connection.
+
+    Mirror of SendCipher: reads the nonce off the wire once, then tracks
+    the same increment-per-AEAD-operation chain.
+    """
+
+    def __init__(self, key):
+        self.key = key
+        self._nonce = None
+
+    async def read_segment(self, reader):
+        """Read and decrypt one segment from an asyncio StreamReader.
+
+        Returns the decoded metadata dict with a "payload" key. Raises
+        IncompleteReadError / ConnectionResetError at EOF.
+        """
+        if self._nonce is None:
+            head = await reader.readexactly(24 + 48)
+            self._nonce = head[:24]
+            meta_ct = head[24:]
+        else:
+            self._nonce = increment_nonce(self._nonce)
+            meta_ct = await reader.readexactly(48)
+        info = decode_metadata(_aead_decrypt(self.key, self._nonce, meta_ct))
+        if info["type"] in (DATA_CLIENT_TO_SERVER, DATA_SERVER_TO_CLIENT,
+                            ACK_CLIENT_TO_SERVER, ACK_SERVER_TO_CLIENT):
+            prefix_len = info.get("prefix_length", 0)
+            if prefix_len:
+                await reader.readexactly(prefix_len)
+        payload_len = info.get("payload_length", 0)
+        if payload_len:
+            self._nonce = increment_nonce(self._nonce)
+            ct = await reader.readexactly(payload_len + 16)
+            info["payload"] = _aead_decrypt(self.key, self._nonce, ct)
+        else:
+            info["payload"] = b""
+        suffix_len = info.get("suffix_length", 0)
+        if suffix_len:
+            await reader.readexactly(suffix_len)
+        return info
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +336,6 @@ __all__ = [
     "TIME_SALT_INTERVAL", "MAX_TIME_SKEW",
     "derive_key", "time_salt_candidates", "make_nonce", "stamp_nonce",
     "encode_session_metadata", "encode_data_metadata", "decode_metadata",
-    "Session", "decrypt",
+    "increment_nonce", "SendCipher", "RecvCipher",
     "encapsulate_udp", "decapsulate_udp",
 ]

@@ -1,20 +1,28 @@
-"""mieru client: owns the control connection and multiplexes streams.
+"""mieru client: owns the control connection and multiplexes sessions.
 
-One TCP control connection carries every session. Each proxied TCP
-connection gets its own session id; data flows in both directions as a
-pair of async pipes. Sessions are torn down when the pipes finish.
+One TCP connection carries every session. Encryption state lives at the
+connection level (SendCipher/RecvCipher), not the session level: the
+nonce chain belongs to the direction of the stream, and every session
+multiplexed on it shares the same chain. Each session only tracks its
+own id and sequence number.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import random
 import struct
 import time
 
 from letuc.core import protocol as mieru
 
 logger = logging.getLogger(__name__)
+
+# advertised per-segment receive window; the server uses this for flow
+# control, a generous constant is fine for a minimal client
+_WINDOW_SIZE = 65535
 
 
 class MieruClient:
@@ -26,9 +34,11 @@ class MieruClient:
         self.mtu = mtu
         self._reader = None
         self._writer = None
+        self._send = None  # SendCipher, created at start()
+        self._recv = None  # RecvCipher, created at start()
+        self._write_lock = asyncio.Lock()
         self._next_session_id = 1
         self._sessions = {}  # session_id -> _SessionState
-        self._lock = asyncio.Lock()
         self._running = False
         self._drain_task = None
 
@@ -37,8 +47,12 @@ class MieruClient:
         return self._writer is not None and not self._writer.is_closing()
 
     async def start(self):
+        key = mieru.derive_key(
+            self.username, self.password, mieru.round_time(int(time.time())))
         self._reader, self._writer = await asyncio.open_connection(
             self.host, self.port)
+        self._send = mieru.SendCipher(key, self.username)
+        self._recv = mieru.RecvCipher(key)
         self._running = True
         self._drain_task = asyncio.create_task(self._drain())
 
@@ -58,160 +72,164 @@ class MieruClient:
                 pass
 
     async def open_tunnel(self):
-        """Open a session that carries raw IP packets for the TUN device.
-
-        Unlike connect() there is no host/port to negotiate — the session
-        is a bare pipe and every packet is just a data segment.
-        """
-        key = self._current_key()
-        async with self._lock:
-            session_id = self._next_session_id
-            self._next_session_id += 1
-
-        sess = mieru.Session(session_id, key, self.username)
-        state = _SessionState(sess)
-        self._sessions[session_id] = state
-
-        segment = sess.encrypt(mieru.OPEN_SESSION_REQUEST, b"")
-        self._writer.write(segment)
-        await self._writer.drain()
-
-        info = await state.response
-        if info.get("status", 0) != 0:
-            raise ConnectionError(
-                f"tunnel session rejected: status={info.get('status')}")
-        return _ProxyReader(state), _ProxyWriter(state, self, sess)
+        """Open a session that carries raw IP packets for the TUN device."""
+        state = await self._open_session(b"")
+        return state.reader, _ProxyWriter(state, self)
 
     async def connect(self, host, port):
-        """Open a proxied TCP connection.
+        """Open a proxied TCP connection. Returns (reader, writer).
 
-        Returns (reader, writer) usable like asyncio streams.
+        Upstream runs a socks5 server inside every session with client
+        side authentication enabled, so there is no greeting exchange on
+        the session at all: the openSessionRequest piggybacks the full
+        RFC 1928 CONNECT request, and the server replies with a single
+        socks5 response. We complete that handshake here so callers get
+        a clean byte stream.
         """
-        key = self._current_key()
-        async with self._lock:
-            session_id = self._next_session_id
-            self._next_session_id += 1
+        state = await self._open_session(
+            b"\x05\x01\x00" + _encode_socks5_addr(host, port))
 
-        sess = mieru.Session(session_id, key, self.username)
-        state = _SessionState(sess)
+        head = await asyncio.wait_for(state.reader.readexactly(4), 15)
+        if head[0] != 0x05 or head[1] != 0x00:
+            raise ConnectionError(
+                "connect %s:%d refused by remote socks5: rep=%d"
+                % (host, port, head[1] if len(head) > 1 else -1))
+        atyp = head[3]
+        if atyp == 0x01:
+            await state.reader.readexactly(4)
+        elif atyp == 0x03:
+            n = (await state.reader.readexactly(1))[0]
+            await state.reader.readexactly(n)
+        elif atyp == 0x04:
+            await state.reader.readexactly(16)
+        await state.reader.readexactly(2)
+
+        return state.reader, _ProxyWriter(state, self)
+
+    async def _open_session(self, payload):
+        session_id = self._alloc_session_id()
+        state = _SessionState(session_id)
         self._sessions[session_id] = state
-
-        payload = _encode_target(host, port)
-        segment = sess.encrypt(mieru.OPEN_SESSION_REQUEST, payload)
-        self._writer.write(segment)
-        await self._writer.drain()
-
+        await self._send_segment(
+            state, mieru.OPEN_SESSION_REQUEST, payload)
         info = await state.response
         if info.get("status", 0) != 0:
+            self._sessions.pop(session_id, None)
             raise ConnectionError(
                 f"openSession rejected: status={info.get('status')}")
+        return state
 
-        reader = _ProxyReader(state)
-        writer = _ProxyWriter(state, self, sess)
-        return reader, writer
+    def _alloc_session_id(self):
+        sid = self._next_session_id
+        self._next_session_id += 1
+        return sid
 
-    def _current_key(self):
-        rounded = round(int(time.time()) / mieru.TIME_SALT_INTERVAL) * mieru.TIME_SALT_INTERVAL
-        return mieru.derive_key(self.username, self.password, rounded)
+    async def _send_segment(self, state, protocol_type, payload=b""):
+        """Encrypt and write one segment for a session.
+
+        Session segments (open/close) take no prefix padding; data
+        segments may carry both. Lengths are random in [0, 255] like
+        upstream, so packet sizes don't fingerprint content length.
+        """
+        ts = int(time.time() // 60) & 0xFFFFFFFF
+        suffix = _rand_padding()
+        if protocol_type in (mieru.OPEN_SESSION_REQUEST,
+                             mieru.CLOSE_SESSION_REQUEST):
+            prefix = b""
+            metadata = mieru.encode_session_metadata(
+                protocol_type, ts, state.session_id, state.send_seq,
+                0, len(payload), len(suffix))
+        else:
+            prefix = _rand_padding()
+            metadata = mieru.encode_data_metadata(
+                protocol_type, ts, state.session_id, state.send_seq,
+                0, _WINDOW_SIZE, 0, len(prefix), len(payload), len(suffix))
+        segment = self._send.encrypt_segment(metadata, payload, prefix, suffix)
+        state.send_seq += 1
+        async with self._write_lock:
+            self._writer.write(segment)
+            await self._writer.drain()
 
     async def _drain(self):
         while self._running:
             try:
-                head = await self._reader.readexactly(8 + 24 + 48 + 4)
+                info = await self._recv.read_segment(self._reader)
             except (asyncio.IncompleteReadError, ConnectionResetError):
                 break
-            info = self._decrypt_header(head)
-            if info is None:
-                continue
-            tail_len = info.get("payload_length", 0) + 16 + info.get("suffix_length", 0)
-            tail = b""
-            if tail_len:
-                try:
-                    tail = await self._reader.readexactly(tail_len)
-                except (asyncio.IncompleteReadError, ConnectionResetError):
-                    break
-            await self._dispatch(head + tail)
-
-    def _decrypt_header(self, head):
-        # head = padding0(8) + nonce(24) + encrypted_meta(48) + padding1(4)
-        for sid, state in list(self._sessions.items()):
-            try:
-                return mieru.decrypt(state.sess.key, head, state.sess.username)
             except Exception:
-                continue
-        return None
+                logger.exception("segment decrypt/parse failed, stream dead")
+                break
+            logger.debug("rx segment type=%s sid=%s seq=%s plen=%s",
+                         info["type"], info["session_id"],
+                         info.get("sequence"), len(info.get("payload", b"")))
+            self._dispatch(info)
+        for state in list(self._sessions.values()):
+            state.reader.feed_eof()
 
-    async def _dispatch(self, data):
-        for sid, state in list(self._sessions.items()):
-            try:
-                info = mieru.decrypt(state.sess.key, data, state.sess.username)
-            except Exception:
-                continue
-            ptype = info["type"]
-            if ptype == mieru.OPEN_SESSION_RESPONSE:
-                if not state.response.done():
-                    state.response.set_result(info)
-            elif ptype == mieru.CLOSE_SESSION_RESPONSE:
-                self._sessions.pop(sid, None)
-            elif ptype == mieru.DATA_SERVER_TO_CLIENT:
-                state.reader._deliver(info.get("payload", b""))
-            elif ptype == mieru.ACK_SERVER_TO_CLIENT:
-                pass
+    def _dispatch(self, info):
+        state = self._sessions.get(info["session_id"])
+        if state is None:
+            logger.debug("dropped segment for unknown session %s",
+                         info["session_id"])
             return
-        logger.debug("dropped segment for unknown session")
-
-    async def _send(self, sess, protocol_type, payload=b""):
-        segment = sess.encrypt(protocol_type, payload)
-        self._writer.write(segment)
-        await self._writer.drain()
+        ptype = info["type"]
+        if ptype == mieru.OPEN_SESSION_RESPONSE:
+            if not state.response.done():
+                state.response.set_result(info)
+        elif ptype == mieru.CLOSE_SESSION_RESPONSE:
+            self._sessions.pop(info["session_id"], None)
+            state.reader.feed_eof()
+        elif ptype == mieru.DATA_SERVER_TO_CLIENT:
+            payload = info.get("payload", b"")
+            if payload:
+                state.reader.feed_data(payload)
+        elif ptype == mieru.ACK_SERVER_TO_CLIENT:
+            pass
 
     async def _close_session(self, state):
         if not self.connected:
             return
         try:
-            await self._send(state.sess, mieru.CLOSE_SESSION_REQUEST)
+            await self._send_segment(state, mieru.CLOSE_SESSION_REQUEST)
         except Exception:
             pass
 
 
 class _SessionState:
-    def __init__(self, sess):
-        self.sess = sess
+    def __init__(self, session_id):
+        self.session_id = session_id
+        self.send_seq = 0
         self.response = asyncio.get_event_loop().create_future()
-        self.reader = _ProxyReader(self)
+        self.reader = _ProxyReader()
 
 
 class _ProxyReader(asyncio.StreamReader):
-    def __init__(self, state):
-        super().__init__()
-        self._state = state
-
-    def _deliver(self, data):
-        if data:
-            self.feed_data(data)
-        else:
-            self.feed_eof()
+    pass
 
 
 class _ProxyWriter(asyncio.StreamWriter):
-    def __init__(self, state, client, sess):
+    def __init__(self, state, client):
+        # StreamWriter.__del__ touches _transport; we bypass the real
+        # transport, so give it a closed dummy to keep GC quiet
+        self._transport = _ClosedTransport()
         self._state = state
         self._client = client
-        self._sess = sess
 
     def write(self, data):
         if not data:
             return
         for off in range(0, len(data), mieru.MAX_FRAGMENT_SIZE):
             chunk = data[off:off + mieru.MAX_FRAGMENT_SIZE]
-            segment = self._sess.encrypt(mieru.DATA_CLIENT_TO_SERVER, chunk)
-            self._client._writer.write(segment)
+            asyncio.get_event_loop().create_task(
+                self._client._send_segment(
+                    self._state, mieru.DATA_CLIENT_TO_SERVER, chunk))
 
     async def drain(self):
         await self._client._writer.drain()
 
     def close(self):
-        asyncio.get_event_loop().create_task(self._client._close_session(self._state))
+        asyncio.get_event_loop().create_task(
+            self._client._close_session(self._state))
 
     def is_closing(self):
         return False
@@ -220,11 +238,36 @@ class _ProxyWriter(asyncio.StreamWriter):
         pass
 
 
-def _encode_target(host, port):
-    host_bytes = host.encode()
-    if len(host_bytes) > 255:
-        raise ValueError("host too long")
-    return struct.pack(">B", len(host_bytes)) + host_bytes + struct.pack(">H", port)
+class _ClosedTransport:
+    """Minimal stand-in so StreamWriter.__del__ stays silent."""
+
+    def is_closing(self):
+        return True
+
+    def close(self):
+        pass
+
+
+def _rand_padding():
+    """0..255 random bytes, matching upstream's maxPaddingSize of 255."""
+    n = random.randint(0, 255)
+    return os.urandom(n) if n else b""
+
+
+def _encode_socks5_addr(host, port):
+    """RFC 1928 address field: ATYP + ADDR + PORT, big-endian port."""
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        host_bytes = host.encode()
+        if len(host_bytes) > 255:
+            raise ValueError("host too long")
+        return b"\x03" + struct.pack(">B", len(host_bytes)) + host_bytes \
+            + struct.pack(">H", port)
+    if ip.version == 4:
+        return b"\x01" + ip.packed + struct.pack(">H", port)
+    return b"\x04" + ip.packed + struct.pack(">H", port)
 
 
 __all__ = ["MieruClient"]

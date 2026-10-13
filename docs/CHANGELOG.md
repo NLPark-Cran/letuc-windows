@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.2.2 — 2026-10-13
+
+### Fixed
+
+- `src/letuc/core/protocol.py` — TCP wire format rewritten against
+  enfein/mieru v3.38.1 ground truth (official client ↔ local fake server,
+  and our client ↔ real server, both verified live). The nonce is a pure
+  random 24-byte value stamped with a 4-byte user lookup marker, sent on
+  the wire exactly once per direction; every AEAD operation after that
+  (metadata and payload count separately) advances the nonce as one
+  192-bit big-endian counter. The old format invented 8+4 random bytes
+  around the nonce and reused one nonce for metadata and payload, so the
+  server never decrypted a single segment.
+- `src/letuc/core/client.py` — the session carries a full RFC 1928
+  CONNECT request inside the openSessionRequest payload. Upstream runs
+  the in-session socks5 server with client side authentication enabled
+  (`ClientSideAuthentication: true` in the client daemon config), so
+  there is no greeting exchange on the session at all; the server
+  replies with a single 10-byte socks5 response. We used to send the
+  3-byte greeting alone and wait for a 2-byte auth response, which
+  deadlocked against the real server: it read our greeting as the start
+  of a CONNECT request and blocked waiting for bytes that never came.
+  Symptom on every live handshake: openSession accepted, then silence.
+- `src/letuc/core/client.py` — data sequence numbers start at 1
+  (openSessionResponse consumes seq 0); a `_ProxyWriter` no longer
+  trips `StreamWriter.__del__` during GC.
+
+### Added
+
+- `fake_server.py`, `live_probe.py` — ground-truth harness: a minimal
+  Python mieru server used to pin down the wire format against the
+  official v3.38.1 client, and an end-to-end probe that fetches one HTTP
+  page through the real relay.
+
 ## v0.2.1 — 2026-10-13
 
 ### Fixed

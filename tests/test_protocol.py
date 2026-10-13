@@ -96,26 +96,60 @@ def test_aead_wrong_key_fails():
         mieru._aead_decrypt(key2, nonce, ct)
 
 
-def test_session_encrypt_decrypt_roundtrip():
+def _recv_sync(recv_cipher, data):
+    """Feed bytes into a StreamReader and read one segment synchronously."""
+    import asyncio
+
+    async def go():
+        reader = asyncio.StreamReader()
+        reader.feed_data(data)
+        reader.feed_eof()
+        return await recv_cipher.read_segment(reader)
+
+    return asyncio.run(go())
+
+
+def test_cipher_roundtrip_first_segment():
     key = os.urandom(32)
-    sess = mieru.Session(session_id=1, key=key)
+    send = mieru.SendCipher(key, username="alice")
+    recv = mieru.RecvCipher(key)
     payload = b"x" * 100
-    segment = sess.encrypt(mieru.OPEN_SESSION_REQUEST, payload, suffix_length=4)
-    assert len(segment) > 48
-    info = mieru.decrypt(key, segment)
+    metadata = mieru.encode_session_metadata(
+        mieru.OPEN_SESSION_REQUEST, 12345, 1, 0, 0, len(payload), 4)
+    segment = send.encrypt_segment(metadata, payload, suffix=b"s" * 4)
+    # first segment carries the full 24-byte nonce up front
+    assert segment[:24] != b""
+    info = _recv_sync(recv, segment)
     assert info["type"] == mieru.OPEN_SESSION_REQUEST
     assert info["session_id"] == 1
     assert info["payload"] == payload
 
 
-def test_session_sequence_increments():
+def test_cipher_nonce_chain_across_segments():
     key = os.urandom(32)
-    sess = mieru.Session(session_id=1, key=key)
-    s1 = sess.encrypt(mieru.DATA_CLIENT_TO_SERVER, b"a" * 10)
-    s2 = sess.encrypt(mieru.DATA_CLIENT_TO_SERVER, b"b" * 10)
-    i1 = mieru.decrypt(key, s1)
-    i2 = mieru.decrypt(key, s2)
-    assert i2["sequence"] == i1["sequence"] + 1
+    send = mieru.SendCipher(key, username="alice")
+    recv = mieru.RecvCipher(key)
+    wire = b""
+    infos = []
+    # second and later segments must NOT carry a nonce on the wire;
+    # both sides advance the implicit nonce once per AEAD operation
+    for i in range(3):
+        metadata = mieru.encode_data_metadata(
+            mieru.DATA_CLIENT_TO_SERVER, 12345, 1, i, 0, 65535, 0, 2, 10, 3)
+        wire += send.encrypt_segment(metadata, b"p" * 10,
+                                     prefix=b"q" * 2, suffix=b"r" * 3)
+    import asyncio
+
+    async def go():
+        reader = asyncio.StreamReader()
+        reader.feed_data(wire)
+        reader.feed_eof()
+        for _ in range(3):
+            infos.append(await recv.read_segment(reader))
+
+    asyncio.run(go())
+    assert [i["sequence"] for i in infos] == [0, 1, 2]
+    assert all(i["payload"] == b"p" * 10 for i in infos)
 
 
 def test_udp_associate_encapsulate():
