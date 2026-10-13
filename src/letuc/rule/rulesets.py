@@ -88,17 +88,13 @@ SOURCES = {
         "domain", "block", 604800),
 }
 
-# Ad keywords we keep in the hand-written rules even when the lists above
-# are present: the curated lists are domain-based and miss the substring
-# style matches that catch ad-tech hostnames we do not have a list for.
-_FALLBACK_ADS = [
-    "ads", "ad", "adservice", "adserver", "adsystem", "adtech",
-    "advertising", "analytics", "track", "tracker", "telemetry",
-    "beacon", "ping", "stat", "metrics", "measure",
-    "doubleclick", "googlesyndication", "google-analytics",
-    "facebook", "fbcdn", "twimg", "t.co", "bit.ly", "goo.gl",
-    "cloudflare", "akamai", "fastly", "cdn", "cnd",
-]
+# Ad keywords used to live here as a domain_keyword block rule. It was
+# removed: 30 bare substrings ("stat", "cdn", "ping", "akamai", ...) kill
+# legitimate infrastructure hostnames — static.zhihu.com, cv.phncdn.com,
+# cdn.jsdelivr.net all died because the keyword appears inside an innocent
+# label. The curated reject-list.txt + pro.txt below match real ad domains
+# by suffix, which is the right granularity.
+
 
 # Private / special-use ranges. Hard-coded: no external data source covers
 # these reliably, and they never change.
@@ -278,7 +274,6 @@ def build_rules():
     rules = []
 
     # 1. Blocklist first so nothing ad-related ever slips through.
-    block_keywords = list(_FALLBACK_ADS)
     block_suffixes = []
     for name in ("reject-list.txt", "pro.txt"):
         path = _cache_path(name)
@@ -287,10 +282,6 @@ def build_rules():
     if block_suffixes:
         rules.append({"type": "domain_suffix",
                       "domain_suffix": block_suffixes,
-                      "outbound": "block"})
-    if block_keywords:
-        rules.append({"type": "domain_keyword",
-                      "domain_keyword": block_keywords,
                       "outbound": "block"})
 
     # 2. Private ranges and public DNS never leave the machine.
