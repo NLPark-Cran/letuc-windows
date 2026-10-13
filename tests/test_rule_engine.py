@@ -58,7 +58,9 @@ def test_load_default_rules():
     # A foreign domain with no IP is resolved through the default rule and
     # goes proxy; the catch-all 255.0.0.0/8 only fires when an IP is given.
     assert e.match("www.youtube.com", None) == "proxy"
-    assert e.match("ads.google.com", "1.2.3.4") == "block"
+    # The fallback ad keyword rule is gone (it broke static*/cdn* hosts);
+    # ads.google.com is no longer blocked and falls through to proxy.
+    assert e.match("ads.google.com", "1.2.3.4") == "proxy"
 
 
 def test_empty_domain_with_ip(engine):

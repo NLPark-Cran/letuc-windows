@@ -218,7 +218,11 @@ class LetucApp:
         # Prefer the community rule sets when they are cached: they are far
         # more complete than the hand-written defaults. Fall back to the
         # shipped rules.json when the user has never downloaded them.
-        self.engine = RuleEngine(_rulesets.build_rules())
+        # Custom rules saved in the config file go first: the engine is
+        # first-match-wins, so a user rule always beats the community
+        # lists underneath it.
+        user_rules = self.config.get("rules", default=[]) or []
+        self.engine = RuleEngine(user_rules + _rulesets.build_rules())
         self.client = None
         self.socks5 = None
         self.http = None
