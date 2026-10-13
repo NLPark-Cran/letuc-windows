@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.4 — 2026-10-13
+
+### Fixed
+
+- `src/letuc/rule/rulesets.py` — removed the hand-written fallback ad
+  keyword block rule (`stat`, `cdn`, `ping`, `akamai`, ...). Substring
+  matching is the wrong granularity: it killed `static.zhihu.com`,
+  `statics.moonshot.cn` (zhihu rendered as a skeleton, kimi.com went
+  blank in the browser) and `cv.phncdn.com` (PornHub video CDN). The
+  curated reject-list.txt + pro.txt suffix lists already cover real ad
+  domains; `src/letuc/rule/rules.json` regenerated to match.
+
 ## v0.2.3 — 2026-10-13
 
 ### Fixed
