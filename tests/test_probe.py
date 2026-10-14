@@ -21,12 +21,19 @@ def test_instance_has_attributes():
 
     la = Stub()
     la.config = Config()
+    la.user_rules = []
+    la.community_rules = []
     la.engine = RuleEngine()
     la.client = None
     la.socks5 = None
     la.http = None
     la.loop = None
     la.window = None
+
+    def _rebuild():
+        la.engine = RuleEngine(la.user_rules + la.community_rules)
+
+    la.rebuild_engine = _rebuild
 
     w = MainWindow(la)
     for name in ("status_label", "tun_check", "host_edit", "mixed_edit",

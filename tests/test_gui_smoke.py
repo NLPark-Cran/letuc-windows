@@ -25,12 +25,19 @@ def _stub():
 
     la = Stub()
     la.config = Config()
+    la.user_rules = []
+    la.community_rules = []
     la.engine = RuleEngine()
     la.client = None
     la.socks5 = None
     la.http = None
     la.loop = None
     la.window = None
+
+    def _rebuild():
+        la.engine = RuleEngine(la.user_rules + la.community_rules)
+
+    la.rebuild_engine = _rebuild
     return la
 
 
@@ -49,16 +56,21 @@ def test_gui_builds_and_rules_roundtrip():
     assert w.centralWidget().tabText(1) == "规则"
     assert w.centralWidget().tabText(2) == "日志"
 
-    # The rules tab is a list + a form, not a raw text box.
-    assert w.rule_list.count() > 0
+    # The rules tab lists the user's custom rules only (community coverage
+    # is a status line, not 380k list entries), so a fresh stub starts empty.
+    assert w.rule_list.count() == 0
     assert w.rule_value is not None
     assert w.rule_outbound is not None
 
-    # Adding a rule works without crashing the app.
+    # Adding a rule works without crashing the app. The value field feeds
+    # the parser now, not a hardcoded dummy string.
     before = w.rule_list.count()
+    w.rule_value.setText("example.com")
+    w.rule_outbound.setCurrentIndex(1)
     w._on_add_rule()
     app.processEvents()
     assert w.rule_list.count() == before + 1
+    assert "example.com" in w.rule_list.item(0).text()
 
     # Deleting a rule works.
     w._on_del_rule()

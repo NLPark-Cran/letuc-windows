@@ -56,11 +56,17 @@ def _app_icon():
     bases = []
     if getattr(sys, "frozen", False):
         # PyInstaller extracts bundled data to sys._MEIPASS before the
-        # application starts; that is where assets/ actually lives.
+        # application starts. The spec bundles assets/letuc.ico with dest
+        # "assets", so the real location is _MEIPASS\assets\letuc.ico —
+        # searching _MEIPASS root or the exe's own directory misses it and
+        # the tray shows an empty placeholder.
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             bases.append(meipass)
-        bases.append(os.path.dirname(sys.executable))
+            bases.append(os.path.join(meipass, "assets"))
+        exe_dir = os.path.dirname(sys.executable)
+        bases.append(exe_dir)
+        bases.append(os.path.join(exe_dir, "assets"))
     here = os.path.dirname(os.path.abspath(__file__))
     bases.append(here)
     bases.append(os.path.join(here, "assets"))
@@ -216,13 +222,12 @@ class LetucApp:
         self.qapp.setApplicationName("letuc")
         self.config = Config.load_from_file(self._config_path())
         # Prefer the community rule sets when they are cached: they are far
-        # more complete than the hand-written defaults. Fall back to the
-        # shipped rules.json when the user has never downloaded them.
-        # Custom rules saved in the config file go first: the engine is
-        # first-match-wins, so a user rule always beats the community
-        # lists underneath it.
-        user_rules = self.config.get("rules", default=[]) or []
-        self.engine = RuleEngine(user_rules + _rulesets.build_rules())
+        # more complete than the hand-written defaults. Custom rules saved
+        # in the config file go first: the engine is first-match-wins, so a
+        # user rule always beats the community lists underneath it.
+        self.user_rules = self.config.get("rules", default=[]) or []
+        self.community_rules = _rulesets.build_rules()
+        self.engine = RuleEngine(self._merged_rules())
         self.client = None
         self.socks5 = None
         self.http = None
@@ -252,6 +257,14 @@ class LetucApp:
             base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
         return os.path.join(base, "config.json")
 
+    def _merged_rules(self):
+        """User rules in front of community rules: first match wins."""
+        return self.user_rules + self.community_rules
+
+    def rebuild_engine(self):
+        """Rebuild the routing engine after any rule-list mutation."""
+        self.engine = RuleEngine(self._merged_rules())
+
     def run(self):
         # --minimized: launched by the shell at boot, so stay in the tray
         # instead of popping a window in the user's face.
@@ -261,6 +274,13 @@ class LetucApp:
             self.window.show()
         if self.config.get("anti_detection", "clock_check_on_startup"):
             self._check_clock()
+        # 启动时自动设置系统代理 promises the proxy is actually UP after
+        # boot, not just that the app launched. The Run entry only starts
+        # letuc --minimized; without this the tunnel stays down and the
+        # system proxy points at a dead port.
+        if self.config.get("anti_detection", "set_system_proxy_on_start",
+                           default=False):
+            self.window._on_start()
         # qasync stops the asyncio side when the QApplication quits, so a
         # tray quit unwinds both halves in order.
         with self.loop:
@@ -759,7 +779,9 @@ class MainWindow(QMainWindow):
         # Rebuild from defaults, then refresh every widget that mirrors the
         # config so the UI stops disagreeing with the file.
         self.app.config = Config.load_from_file(self.app.config.path)
-        self.app.engine = RuleEngine()
+        self.app.user_rules = self.app.config.get("rules", default=[]) or []
+        self.app.community_rules = _rulesets.build_rules()
+        self.app.rebuild_engine()
         self._sync_from_preset()
         self.preset_combo.clear()
         self.preset_combo.addItems(
@@ -959,22 +981,20 @@ class MainWindow(QMainWindow):
         return w
 
     def _refresh_rule_list(self):
+        # The list edits the USER's custom rules only. Community rule sets
+        # stay underneath as read-only coverage (see the status line); the
+        # old behaviour of listing all 380k community entries made the tab
+        # unusable and "apply" dumped the whole merged list into config.
         self.rule_list.blockSignals(True)
         self.rule_list.clear()
-        for r in self.app.engine._rules:
+        for r in self.app.user_rules:
             rtype = r.get("type", "domain")
             values = r.get(rtype, [])
             tail = {"direct": "直连", "proxy": "代理",
                     "block": "屏蔽"}.get(r.get("outbound", "proxy"), "代理")
-            if rtype == "default":
-                item = QListWidgetItem("(默认)  →  %s" % tail)
-            elif len(values) == 1:
+            if len(values) == 1:
                 item = QListWidgetItem("%s  →  %s" % (values[0], tail))
             else:
-                # A curated list rule holds thousands of entries; showing
-                # only the first would make the UI look broken. Report the
-                # count so the user can tell "this is the blocklist" from
-                # "this is a single hand-typed rule".
                 item = QListWidgetItem(
                     "%s 等 %d 项  →  %s" % (values[0], len(values), tail))
             item.setData(Qt.ItemDataRole.UserRole, r)
@@ -1001,9 +1021,10 @@ class MainWindow(QMainWindow):
             ok = sum(1 for p in results.values() if p)
             self.log.appendPlainText(
                 "更新规则集：%d/%d 成功" % (ok, len(results)))
-            # Rebuild the engine from the freshly cached files and refresh
-            # the rule list so the UI reflects the new coverage.
-            self.app.engine = RuleEngine(_rulesets.build_rules())
+            # Rebuild the community half from the freshly cached files,
+            # keeping the user's custom rules in front.
+            self.app.community_rules = _rulesets.build_rules()
+            self.app.rebuild_engine()
             self._refresh_rule_list()
         except Exception as e:
             self.log.appendPlainText("更新规则集失败：%s" % e)
@@ -1021,17 +1042,32 @@ class MainWindow(QMainWindow):
             {"direct": 0, "proxy": 1, "block": 2}.get(r.get("outbound", "proxy"), 1))
 
     def _on_add_rule(self):
-        rules, err = _parse_rules("google.com 走代理")
-        if err:
+        """Parse the value field + outbound combo into a new user rule.
+
+        This used to parse a hardcoded "google.com 走代理" string, so the
+        button ignored whatever the user typed and always added the same
+        dummy rule.
+        """
+        text = self.rule_value.text().strip()
+        outbound_word = ("需要直连" if self.rule_outbound.currentIndex() == 0
+                         else "走代理" if self.rule_outbound.currentIndex() == 1
+                         else "需要屏蔽")
+        rules, err = _parse_rules("%s %s" % (text, outbound_word))
+        if err or not rules:
+            self.log.appendPlainText("规则错误: %s" % (err or "值不能为空"))
             return
-        self.app.engine._rules.extend(rules)
+        self.app.user_rules.extend(rules)
+        self.app.rebuild_engine()
         self._refresh_rule_list()
+        self.rule_list.setCurrentRow(len(self.app.user_rules) - 1)
+        self.log.appendPlainText("已新增规则：%s" % text)
 
     def _on_del_rule(self):
         row = self.rule_list.currentRow()
         if row < 0:
             return
-        del self.app.engine._rules[row]
+        del self.app.user_rules[row]
+        self.app.rebuild_engine()
         self._refresh_rule_list()
 
     def _on_apply_rule_edit(self):
@@ -1046,16 +1082,23 @@ class MainWindow(QMainWindow):
         if err or not rules:
             self.log.appendPlainText("规则错误: %s" % (err or "值不能为空"))
             return
-        self.app.engine._rules[row] = rules[0]
+        self.app.user_rules[row] = rules[0]
+        self.app.rebuild_engine()
         self._refresh_rule_list()
         self.set_status("rules applied")
         self.log.appendPlainText("已修改第 %d 条规则" % (row + 1))
 
     def _on_apply_rules(self):
-        self.app.config.set(self.app.engine._rules, "rules")
+        """Persist only the user's custom rules.
+
+        Saving the whole merged engine list would freeze all 380k community
+        entries into the config and they would go stale the moment a rule
+        set updates.
+        """
+        self.app.config.set(self.app.user_rules, "rules")
         self.app.config.save()
         self.set_status("rules applied")
-        self.log.appendPlainText("已保存 %d 条规则" % len(self.app.engine._rules))
+        self.log.appendPlainText("已保存 %d 条自定义规则" % len(self.app.user_rules))
 
     # -- log tab ----------------------------------------------------------
 
